@@ -483,6 +483,7 @@ func (h *Handler) validateCreate(config *eksv1.EKSClusterConfig, awsSVCs *awsSer
 	}
 
 	// validate nodegroup version
+	nodeP := map[string]bool{}
 	if !config.Spec.Imported {
 		// Check for existing clusters in EKS with the same display name
 		listOutput, err := awsSVCs.eks.ListClusters(&eks.ListClustersInput{})
@@ -547,6 +548,13 @@ func (h *Handler) validateCreate(config *eksv1.EKSClusterConfig, awsSVCs *awsSer
 					return fmt.Errorf(cannotBeNilError, "instanceType", *ng.NodegroupName, config.Name)
 				}
 			}
+			if ng.NodegroupName == nil {
+				return fmt.Errorf(cannotBeNilError, "name", *ng.NodegroupName, config.Name)
+			}
+			if nodeP[*ng.NodegroupName] {
+				return fmt.Errorf("NodePool names must be unique within the [%s] cluster to avoid duplication", config.Name)
+			}
+			nodeP[*ng.NodegroupName] = true
 			if ng.Version == nil {
 				return fmt.Errorf(cannotBeNilError, "version", *ng.NodegroupName, config.Name)
 			}
@@ -839,8 +847,11 @@ func BuildUpstreamClusterState(name, managedTemplateID string, clusterState *eks
 			NodeRole:             ng.Nodegroup.NodeRole,
 			Subnets:              aws.StringValueSlice(ng.Nodegroup.Subnets),
 			Tags:                 ng.Nodegroup.Tags,
-			Version:              ng.Nodegroup.Version,
 			RequestSpotInstances: aws.Bool(aws.StringValue(ng.Nodegroup.CapacityType) == eks.CapacityTypesSpot),
+		}
+
+		if aws.StringValue(ng.Nodegroup.Status) != eks.NodegroupStatusUpdating {
+			ngToAdd.Version = ng.Nodegroup.Version
 		}
 
 		if aws.BoolValue(ngToAdd.RequestSpotInstances) {
@@ -885,6 +896,9 @@ func BuildUpstreamClusterState(name, managedTemplateID string, clusterState *eks
 				}
 				launchTemplateData := launchTemplateRequestOutput.LaunchTemplateVersions[0].LaunchTemplateData
 
+				if len(launchTemplateData.BlockDeviceMappings) == 0 {
+					return nil, "", fmt.Errorf("launch template for node group [%s] in cluster [%s] is malformed", aws.StringValue(ngToAdd.NodegroupName), upstreamSpec.DisplayName)
+				}
 				ngToAdd.DiskSize = launchTemplateData.BlockDeviceMappings[0].Ebs.VolumeSize
 				ngToAdd.Ec2SshKey = launchTemplateData.KeyName
 				ngToAdd.ImageID = launchTemplateData.ImageId
@@ -1061,7 +1075,8 @@ func (h *Handler) updateUpstreamClusterState(upstreamSpec *eksv1.EKSClusterConfi
 		// nodegroup may not be immediate
 		if config.Status.Phase != eksConfigUpdatingPhase {
 			config.Status.Phase = eksConfigUpdatingPhase
-			config, err := h.eksCC.UpdateStatus(config)
+			var err error
+			config, err = h.eksCC.UpdateStatus(config)
 			if err != nil {
 				return config, err
 			}
